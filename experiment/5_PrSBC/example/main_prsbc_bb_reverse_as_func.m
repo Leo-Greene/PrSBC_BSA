@@ -33,7 +33,7 @@ params.v_max = params.vmax;
 
 % Safety property
 params.dmin = 1.7;
-params.R_safe = 1.9;
+params.R_safe = 1.7;
 
 % initial configuration
 params.diameter = 15;

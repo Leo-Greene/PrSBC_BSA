@@ -85,18 +85,22 @@ end
 % --- Step 2: 实现分层抽样 (Stratified Sampling) 确保 Split 分布均匀 ---
 
 unique_tags = {'default', 'init_perturb', 'geometry_perturb', 'boundary_focus'};
-train_ratio = 0.70;
-val_ratio = 0.15;
+train_ratio = 0.80;
+val_ratio = 0.20;
 
 for t = 1:numel(unique_tags)
     tag_name = unique_tags{t};
-    % 找到属于当前 tag 的所有索引
+    % 找到属于当前 tag 的所有索引，并在组内打散
     idx = find(strcmp({cases.tag}, tag_name));
+    idx = idx(randperm(numel(idx)));
     n_tag = numel(idx);
     
     % 计算该组内的切分点
     n_train = round(n_tag * train_ratio);
     n_val = round(n_tag * val_ratio);
+    if n_train + n_val > n_tag
+        n_val = max(0, n_tag - n_train);
+    end
     
     % 分配数据子集
     for k = 1:n_tag

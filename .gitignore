@@ -26,10 +26,7 @@ traj/step5_prsbc/
 !traj/step3_collect/.gitkeep
 
 # 忽略训练输出的模型和日志
-experiment/train/out/20*
-experiment/train/out/*.pt
-experiment/train/out/*.onnx
-experiment/train/out/*.json
+experiment/2_train/out/
 
 # 忽略验证输出的结果和日志
 experiment/validation/out/20*

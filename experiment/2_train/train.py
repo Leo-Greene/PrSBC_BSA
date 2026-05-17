@@ -68,6 +68,9 @@ class TrajectoryDataset(Dataset):
                 pos = X_all[:, :30]
                 dist_sq = np.sum((pos[1:] - pos[:-1])**2, axis=1)
                 boundaries = np.where(dist_sq > 25.0)[0] + 1
+            boundary_count = int(boundaries.shape[0])
+            boundary_preview = boundaries[:10].tolist() if boundary_count > 0 else []
+            print(f"--> Trajectory boundaries detected: {boundary_count} | preview={boundary_preview}")
             
             # 计算或接收统计量
             if stats is None:
@@ -212,9 +215,12 @@ def compute_mixed_loss(model, x_seq, u_seq, r_lbl_seq, stats_t, horizon, alpha, 
 def train():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=120)
+    parser.add_argument('--epochs', type=int, default=150)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--horizon', type=int, default=None)
+    parser.add_argument('--beta_fixed', type=float, default=None)
+    parser.add_argument('--x0_noise_std', type=float, default=0.005)
     args = parser.parse_args()
 
     TRAIN_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -234,7 +240,8 @@ def train():
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    HORIZON, BATCH_SIZE, EPOCHS, LR = GLOBAL_HORIZON, args.batch_size, args.epochs, args.lr # 使用全局定义的 HORIZON
+    HORIZON = args.horizon if args.horizon is not None else GLOBAL_HORIZON
+    BATCH_SIZE, EPOCHS, LR = args.batch_size, args.epochs, args.lr
 
     # 加载数据集
     train_ds = TrajectoryDataset(os.path.join(DATA_DIR, 'dataset_train.mat'), horizon=HORIZON)
@@ -270,16 +277,36 @@ def train():
     PATIENCE_LIMIT = 25
     patience_counter = 0
 
+    best_val_loss = float('inf')  # 初始最佳 loss 设为正无穷
+    patience_counter = 0          # 初始化耐心计数器（用于早停）
+
+    def beta_for_epoch(epoch_idx):
+        if args.beta_fixed is not None:
+            return float(args.beta_fixed)
+        if epoch_idx <= 20:
+            return 0.0
+        if epoch_idx <= 70:
+            return (epoch_idx - 20) / 50.0
+        return 1.0
+
+    print(
+        "--> Train config | horizon=%d | beta_fixed=%s | x0_noise_std=%.4f" % (
+            HORIZON,
+            "None" if args.beta_fixed is None else f"{args.beta_fixed:.3f}",
+            args.x0_noise_std,
+        )
+    )
+
     for epoch in range(EPOCHS):
         model.train()
         train_l = 0
-        beta_curr = min(0.1 + epoch/60, 0.5)
+        beta_curr = beta_for_epoch(epoch)
 
         for x_seq, u_seq, r_lbl in train_loader:
             x_seq, u_seq, r_lbl = x_seq.to(DEVICE), u_seq.to(DEVICE), r_lbl.to(DEVICE)
             
             # 使用高效加噪：只对 x0 掩码加噪，不 clone 整个序列
-            noise = torch.randn_like(x_seq[:, 0, :]) * 0.005
+            noise = torch.randn_like(x_seq[:, 0, :]) * args.x0_noise_std
             x0_aug = x_seq[:, 0, :] + noise
 
             optimizer.zero_grad()
@@ -304,23 +331,40 @@ def train():
                 x_seq, u_seq, r_lbl = x_seq.to(DEVICE), u_seq.to(DEVICE), r_lbl.to(DEVICE)
                 v_loss = compute_mixed_loss(
                     model, x_seq, u_seq, r_lbl, stats_t, HORIZON, 
-                    alpha=1.0, beta=0.5, x0_override=None,
+                    alpha=1.0, beta=beta_curr, x0_override=None,
                     vmax=vmax_val, pFactor=pFactor_val, predator=predator_val, dt=dt_val, n=n_val
                 )
                 val_l += v_loss.item()
         
         avg_train = train_l / len(train_loader); avg_val = val_l / len(val_loader)
         scheduler.step(avg_val)
+        
+        # 检查是否进入平稳期 (假设你的 beta 最大值是 1.0)
+        is_curriculum_stable = (beta_curr >= 1.0) 
 
-        if avg_val < best_val:
-            best_val = avg_val; patience_counter = 0
+        # 只要还在上难度（非平稳期），或者损失真的下降了，就保存并重置耐心值
+        if (not is_curriculum_stable) or (avg_val < best_val_loss):
+            best_val_loss = avg_val
+            patience_counter = 0
             best_state_dict = copy.deepcopy(model.state_dict())
+            
             for save_dir in [RUN_OUT_DIR, BACKUP_DIR]:
+                # 1. 存模型权重
                 torch.save(best_state_dict, os.path.join(save_dir, 'residual_model.pt'))
+                
+                # 2. 存归一化参数
                 with open(os.path.join(save_dir, 'scaling_stats.json'), 'w') as f:
                     json.dump({k: v.tolist() for k, v in train_ds.stats.items()}, f)
                 
-                # 导出物理参数以供验证 (使用 NumpyEncoder 处理 ndarray)
+                # ---------------------------------------------------------
+                # 3. [新增] 存验证集残差方差 (供 MATLAB PrSBC 自动缩紧安全边界使用)
+                # ---------------------------------------------------------
+                metrics = {"residual_variance": float(best_val_loss)}
+                with open(os.path.join(save_dir, 'validation_metrics.json'), 'w') as f:
+                    json.dump(metrics, f, indent=4)
+                # ---------------------------------------------------------
+
+                # 4. 导出物理参数以供验证 (使用 NumpyEncoder 处理 ndarray)
                 if hasattr(train_ds, 'physical_params') and train_ds.physical_params:
                     import numpy as np
                     class NumpyEncoder(json.JSONEncoder):
@@ -331,13 +375,16 @@ def train():
                     with open(os.path.join(save_dir, 'physical_params.json'), 'w') as f:
                         json.dump(train_ds.physical_params, f, indent=4, cls=NumpyEncoder)
         else:
+            # 只有在平稳期且 Loss 上升时，才累加耐心值
             patience_counter += 1
 
-        if (epoch+1) % 5 == 0:
-            print(f"Epoch {epoch+1:03d} | Train: {avg_train:.6f} | Val: {avg_val:.6f} | B: {beta_curr:.2f} | Best: {best_val:.6f}")
+        # 打印日志 (已修复变量名报错，并增加 Patience 显示)
+        if (epoch+1) % 5 == 0 or epoch == 0:
+            print(f"Epoch {epoch+1:03d} | Train: {avg_train:.6f} | Val: {avg_val:.6f} | B: {beta_curr:.2f} | Best: {best_val_loss:.6f} | Patience: {patience_counter}")
 
+        # 早停触发
         if patience_counter >= PATIENCE_LIMIT:
-            print(f"--> Early Stopping at epoch {epoch+1}. Best Val: {best_val:.6f}")
+            print(f"--> Early Stopping at epoch {epoch+1}. Best Val: {best_val_loss:.6f}")
             break
 
 if __name__ == "__main__":

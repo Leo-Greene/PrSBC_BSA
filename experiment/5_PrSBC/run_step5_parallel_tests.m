@@ -2,7 +2,7 @@
 % 作用：并行运行带有 PrSBC 过滤器和不带过滤器的 Simplex 架构，对比其安全性与性能。
 
 clc; clear; close all;
-num_runs = 20; % 设置测试轮数，建议根据 CPU 核心数调整
+num_runs = 16; % 设置测试轮数，建议根据 CPU 核心数调整
 project_root = fileparts(fileparts(fileparts(mfilename('fullpath'))));
 
 % 定义路径

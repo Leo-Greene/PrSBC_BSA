@@ -72,27 +72,13 @@ params.wt = 10;
 params.ws_bb = 3000;
 params.w_orient = 20;
 
-% Unmodeled params in true_dynamics (defaults, can be overridden by cfg.params_overrides)
-% params.acc_scale = 0.95;
-% params.acc_bias = 0;
-% params.damping = 0.03;
-% params.nonlinear_drift = false;
-% params.noise_std = 0;
-% params.control_noise_std = 0; % Optional small action perturbation for exploration cases.
+% Process and observation noise defaults (aligned with main_bb_reverse.m).
+params.epsilon_w_pos = 0.2 * params.vmax * params.dt;
+params.epsilon_v_pos = 0.2 * params.dmin;
+params.epsilon_v_vel = 0.2 * params.vmax;
+params.sigma_obs_pos = params.epsilon_v_pos / 3;
+params.sigma_obs_vel = params.epsilon_v_vel / 3;
 
-% params.acc_scale = 0.85;
-% params.acc_bias = 0;
-% params.damping = 0.08;
-% params.nonlinear_drift = false;
-% params.noise_std = 0.005;
-% params.control_noise_std = 0; % Optional small action perturbation for exploration cases.
-
-params.acc_scale = 0.7;
-params.acc_bias = 0.1;
-params.damping = 0.15;
-params.nonlinear_drift = true;
-params.noise_std = 0.05;
-params.control_noise_std = 0; % Optional small action perturbation for exploration cases.
 
 params.predator = 0;
 params.pFactor = 1.40;
@@ -116,13 +102,21 @@ x = zeros([params.steps, params.n]);
 y = zeros([params.steps, params.n]);
 vx = zeros([params.steps, params.n]);
 vy = zeros([params.steps, params.n]);
+x_obs = zeros([params.steps, params.n]);
+y_obs = zeros([params.steps, params.n]);
+vx_obs = zeros([params.steps, params.n]);
+vy_obs = zeros([params.steps, params.n]);
 ax = zeros([params.steps + 1, params.n]);
 ay = zeros([params.steps + 1, params.n]);
+ax_des = zeros([params.steps + 1, params.n]);
+ay_des = zeros([params.steps + 1, params.n]);
 mpc_cost = zeros(1, params.steps);
 f = zeros(1, params.steps);
 bb_sp = zeros(1, params.steps);
 bb_orient = zeros(1, params.steps);
 policy = ones(1, params.steps);
+is_BC_active = false(1, params.steps);
+episode_id = cfg.case_id * ones(1, params.steps);
 
 exit_flag_optimizer = zeros(1, params.steps);
 a_sequence = zeros(params.steps, params.n, 2, params.h_bc + 1);
@@ -147,13 +141,24 @@ mde = 1;
 
 tStart = tic;
 for t = 1:params.steps
-    if mod(t - 1, controller_run) == 0
-        [a_ac, fval, e_flag, ~, ~] = controller_cmpc_2d(pos, vel, params, opt);
+    for i = 1:params.n
+        v_i_pos = params.sigma_obs_pos * randn(2, 1);
+        v_i_vel = params.sigma_obs_vel * randn(2, 1);
+        hat_pos(:, i) = pos(:, i) + v_i_pos;
+        hat_vel(:, i) = vel(:, i) + v_i_vel;
+    end
+    x_obs(t, :) = hat_pos(1, :);
+    y_obs(t, :) = hat_pos(2, :);
+    vx_obs(t, :) = hat_vel(1, :);
+    vy_obs(t, :) = hat_vel(2, :);
 
-        [next_pos, next_vel] = next_state(pos, vel, a_ac, params);
+    if mod(t - 1, controller_run) == 0
+        [a_ac, fval, e_flag, ~, ~] = controller_cmpc_2d(hat_pos, hat_vel, params, opt);
+
+        [next_pos, next_vel] = next_state(hat_pos, hat_vel, a_ac, params);
         [~, ~, ~, ~, ~, a_h] = controller_safety_bb(next_pos, next_vel, params, opt);
 
-        [decision, result] = decison_module(pos, vel, params, a_ac, a_h);
+        [decision, result] = decison_module(hat_pos, hat_vel, params, a_ac, a_h);
 
         if mde == 1
             if decision
@@ -194,24 +199,35 @@ for t = 1:params.steps
             end
         end
     else
-        acc = [ax(t, :); ay(t, :)];
+        acc_des = [ax_des(t, :); ay_des(t, :)];
+        acc_actual = [ax(t, :); ay(t, :)];
     end
 
-    if isfield(params, 'control_noise_std') && params.control_noise_std > 0
-        acc = acc + params.control_noise_std .* randn(size(acc));
+    if mod(t - 1, controller_run) == 0
+        acc_des = acc;
+        acc_actual = acc_des;
+        if isfield(params, 'control_noise_std') && params.control_noise_std > 0
+            acc_actual = acc_actual + params.control_noise_std .* randn(size(acc_actual));
+        end
+        if isfield(params, 'explore_noise_std') && params.explore_noise_std > 0
+            acc_actual = acc_actual + params.explore_noise_std .* randn(size(acc_actual));
+        end
     end
 
-    [pos, vel] = true_dynamics(pos, vel, acc, params);
+    [pos, vel] = plant_dynamics(pos, vel, acc_actual, params);
 
     x(t + 1, :) = pos(1, :);
     y(t + 1, :) = pos(2, :);
     vx(t + 1, :) = vel(1, :);
     vy(t + 1, :) = vel(2, :);
-    ax(t + 1, :) = acc(1, :);
-    ay(t + 1, :) = acc(2, :);
+    ax_des(t + 1, :) = acc_des(1, :);
+    ay_des(t + 1, :) = acc_des(2, :);
+    ax(t + 1, :) = acc_actual(1, :);
+    ay(t + 1, :) = acc_actual(2, :);
 
     a_ac_traj(:, :, t + 1) = a_ac;
     policy(t) = mde;
+    is_BC_active(t) = (mde == 2);
     a_sequence(t + 1, :, :, :) = a_h;
     mpc_cost(t) = fval;
     exit_flag_optimizer(t) = e_flag;
@@ -225,8 +241,14 @@ traj.x = x;
 traj.y = y;
 traj.vx = vx;
 traj.vy = vy;
+traj.x_obs = x_obs;
+traj.y_obs = y_obs;
+traj.vx_obs = vx_obs;
+traj.vy_obs = vy_obs;
 traj.ax = ax(1:params.steps, :);
 traj.ay = ay(1:params.steps, :);
+traj.ax_des = ax_des(1:params.steps, :);
+traj.ay_des = ay_des(1:params.steps, :);
 % Applied actions aligned with transitions x_k -> x_{k+1}.
 traj.ax_applied = ax(2:params.steps + 1, :);
 traj.ay_applied = ay(2:params.steps + 1, :);
@@ -240,6 +262,8 @@ traj.bb_sp = bb_sp;
 traj.bb_orient = bb_orient;
 traj.result = rslt;
 traj.policy = policy;
+traj.is_BC_active = is_BC_active;
+traj.episode_id = episode_id;
 
 run_info = struct();
 run_info.case_id = cfg.case_id;

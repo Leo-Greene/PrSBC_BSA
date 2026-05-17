@@ -98,11 +98,12 @@ function [A_sbc, b_sbc] = compute_PrSBC_constraints(pos, vel, params)
 
             % % 瑞利分布逆函数：计算出最坏情况下的概率边界半径
             % epsilon_total = sigma_total * sqrt(-2 * log(1 - Confidence));
-            sigma_obs = params.sigma_obs_pos;  
+            sigma_obs = params.sigma_obs_pos; 
+            sigma_vel = params.sigma_obs_vel; 
             epsilon_w = params.epsilon_w_pos;  
 
             % 两个独立高斯分布相减，方差相加
-            sigma_total_sq = 2 * sigma_obs^2 + epsilon_w^2;
+            sigma_total_sq = 2 * (sigma_obs^2 + (sigma_vel * dt)^2 + epsilon_w^2);
             sigma_total = sqrt(sigma_total_sq);
 
             % --- 破除保守性：1D 单边高斯投影 ---
